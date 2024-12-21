@@ -1,8 +1,6 @@
 import os
-import shutil
 import pandas as pd
 import numpy as np
-from tqdm.auto import tqdm
 from rdkit import Chem
 from rdkit.Chem import QED
 from chembl_webresource_client.new_client import new_client
@@ -18,8 +16,9 @@ molecule = new_client.molecule
 # Define global constants
 ACTIVITY_TYPES = ["IC50", "EC50", "Ki", "Kd", "AC50", "GI50", "MIC"]
 
-# Define reusable functions from your script
+# Functions
 def extract_properties(smiles):
+    """Extract HBD, HBA, and Heavy Atoms from SMILES."""
     if smiles == 'N/A':
         return np.nan, np.nan, np.nan
     try:
@@ -33,74 +32,137 @@ def extract_properties(smiles):
     except:
         return np.nan, np.nan, np.nan
 
-# Other helper functions like `get_target_info_from_uniprot` and `get_compounds_for_target`
-# can stay the same or be refactored similarly.
+def get_target_info_from_uniprot(uniprot_id):
+    """Get ChEMBL target information from UniProt ID."""
+    try:
+        targets = target.filter(target_components__accession=uniprot_id)
+        return list(targets)
+    except Exception as e:
+        st.error(f"Error finding target for UniProt ID {uniprot_id}: {str(e)}")
+        return []
+
+def fetch_and_calculate(chembl_id):
+    """Fetch molecule data and calculate properties for a given ChEMBL ID."""
+    try:
+        mol_data = molecule.get(chembl_id)
+        if not mol_data:
+            return []
+        molecular_properties = mol_data.get('molecule_properties', {})
+        molecular_weight = float(molecular_properties.get('full_mwt', np.nan))
+        psa = float(molecular_properties.get('psa', np.nan))
+        smiles = mol_data.get('molecule_structures', {}).get('canonical_smiles', 'N/A')
+        molecule_name = mol_data.get('pref_name', 'Unknown Name')
+        hbd, hba, heavy_atoms = extract_properties(smiles)
+        npol = hbd + hba if hbd is not None and hba is not None else np.nan
+
+        # Get bioactivities
+        bioactivities = list(activity.filter(
+            molecule_chembl_id=chembl_id,
+            standard_type__in=ACTIVITY_TYPES
+        ).only(
+            'standard_value', 'standard_units', 'standard_type', 'target_chembl_id'
+        ))
+
+        results = []
+        for act in bioactivities:
+            if act['standard_value'] and act['standard_units'] == 'nM':
+                value = float(act['standard_value'])
+                activity_type = act['standard_type']
+                pActivity = -np.log10(value * 1e-9)
+                sei = pActivity / (psa / 100) if psa else np.nan
+                bei = pActivity / (molecular_weight / 1000) if molecular_weight else np.nan
+                results.append({
+                    'ChEMBL ID': chembl_id,
+                    'Molecule Name': molecule_name,
+                    'SMILES': smiles,
+                    'Molecular Weight': molecular_weight,
+                    'TPSA': psa,
+                    'Activity Type': activity_type,
+                    'Activity (nM)': value,
+                    'pActivity': pActivity,
+                    'SEI': sei,
+                    'BEI': bei,
+                    'HBD': hbd,
+                    'HBA': hba,
+                    'Heavy Atoms': heavy_atoms,
+                    'NPOL': npol
+                })
+
+        return results
+    except Exception as e:
+        st.error(f"Error processing {chembl_id}: {str(e)}")
+        return []
+
+def create_analysis_plots(df_results):
+    """Display analysis plots in Streamlit."""
+    st.subheader("Activity Distribution by Target and Type")
+    plt.figure(figsize=(12, 6))
+    sns.boxplot(data=df_results, x='Activity Type', y='pActivity')
+    plt.xticks(rotation=45)
+    plt.title("Activity Distribution")
+    st.pyplot(plt)
+
+    st.subheader("SEI vs BEI")
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(data=df_results, x='SEI', y='BEI', hue='Activity Type', alpha=0.6)
+    plt.title("SEI vs BEI")
+    st.pyplot(plt)
 
 def process_uniprot_target(uniprot_id):
-    """Process a UniProt ID and return a summary and results"""
-    folder_name = uniprot_id
-    if os.path.exists(folder_name):
-        shutil.rmtree(folder_name)
-    os.makedirs(folder_name)
-    
+    """Process a UniProt ID and analyze all associated compounds."""
     targets = get_target_info_from_uniprot(uniprot_id)
     if not targets:
-        return None, f"No targets found for UniProt ID {uniprot_id}"
-    
-    # Collect data for Streamlit display
-    target_summary = []
+        st.warning(f"No targets found for UniProt ID {uniprot_id}")
+        return None, None
+
+    st.write(f"Found {len(targets)} target(s) for UniProt ID {uniprot_id}")
     all_results = []
-    
+
     for target_info in targets:
         target_chembl_id = target_info['target_chembl_id']
-        target_name = target_info.get('pref_name', 'Unknown')
-        compounds, activities = get_compounds_for_target(target_chembl_id)
-        target_summary.append({
-            'ChEMBL Target ID': target_chembl_id,
-            'Target Name': target_name,
-            'Compound Count': len(compounds),
-            'Activity Count': len(activities),
-        })
+        st.write(f"Processing target: {target_chembl_id}")
+        compounds = [act['molecule_chembl_id'] for act in activity.filter(
+            target_chembl_id=target_chembl_id,
+            standard_type__in=ACTIVITY_TYPES
+        ).only('molecule_chembl_id')]
+
         for chembl_id in compounds:
             results = fetch_and_calculate(chembl_id)
             all_results.extend(results)
-    
-    # Convert results to DataFrame for visualization
+
     if all_results:
         df_results = pd.DataFrame(all_results)
-        return df_results, target_summary
+        return df_results, targets
     else:
-        return None, target_summary
+        return None, targets
 
 # Streamlit App
 st.title("ChEMBL Analysis System")
+st.markdown("Enter a UniProt ID to analyze associated compounds and targets.")
 
-# User input
-uniprot_id = st.text_input("Enter a UniProt ID:", "")
+uniprot_id = st.text_input("Enter a UniProt ID:")
 
 if st.button("Analyze"):
     if uniprot_id.strip():
         with st.spinner("Processing..."):
-            results, summary = process_uniprot_target(uniprot_id.strip())
-        if results is not None:
-            st.success("Processing complete!")
-            
-            # Display Target Summary
-            st.subheader("Target Summary")
-            st.write(pd.DataFrame(summary))
-            
-            # Display Results
-            st.subheader("Compound Analysis Results")
-            st.dataframe(results)
-            
+            df_results, targets = process_uniprot_target(uniprot_id.strip())
+
+        if df_results is not None:
+            st.success("Analysis Complete!")
+            st.subheader("Compound Results")
+            st.dataframe(df_results)
+
             # Downloadable CSV
-            csv = results.to_csv(index=False).encode('utf-8')
+            csv = df_results.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="Download Results as CSV",
                 data=csv,
                 file_name=f"{uniprot_id}_results.csv",
                 mime='text/csv',
             )
+
+            # Show Plots
+            create_analysis_plots(df_results)
         else:
             st.warning("No results generated.")
     else:
