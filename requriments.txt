@@ -1,0 +1,8 @@
+streamlit
+rdkit
+chembl-webresource-client
+pandas
+numpy
+matplotlib
+seaborn
+tqdm
